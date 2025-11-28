@@ -21,7 +21,11 @@ from lms.djangoapps.discussion.rest_api.serializers import (
     CommentSerializer,
     ThreadSerializer,
     filter_spam_urls_from_html,
-    get_context
+    get_context,
+    MuteStatusSerializer,
+    UnmuteRequestSerializer,
+    MuteAndReportRequestSerializer,
+    MuteRequestSerializer,
 )
 from lms.djangoapps.discussion.rest_api.tests.utils import (
     CommentsServiceMockMixin,
@@ -880,3 +884,101 @@ class FilterSpamTest(SharedModuleStoreTestCase):
             filter_spam_urls_from_html('<div>example.com/abc/def</div>')[0],
             '<div></div>'
         )
+
+
+class ModerationSerializerTest(SharedModuleStoreTestCase):
+    """
+    Tests for moderation-related serializers
+    """
+
+    def test_mute_request_serializer_validation(self):
+        """Test MuteRequestSerializer validation"""
+
+        # Valid data
+        valid_data = {
+            'muted_user_id': 123,
+            'course_id': 'course-v1:Test+Course+Run',
+            'scope': 'personal',
+            'reason': 'Test reason'
+        }
+        serializer = MuteRequestSerializer(data=valid_data)
+        assert serializer.is_valid()
+
+        # Missing required fields
+        invalid_data = {
+            'course_id': 'course-v1:Test+Course+Run'
+        }
+        serializer = MuteRequestSerializer(data=invalid_data)
+        assert not serializer.is_valid()
+        assert 'muted_user_id' in serializer.errors
+
+    def test_mute_and_report_request_serializer(self):
+        """Test MuteAndReportRequestSerializer validation"""
+
+        # Valid data with thread_id
+        valid_data = {
+            'muted_user_id': 123,
+            'course_id': 'course-v1:Test+Course+Run',
+            'scope': 'personal',
+            'reason': 'Inappropriate content',
+            'thread_id': 'test_thread_123'
+        }
+        serializer = MuteAndReportRequestSerializer(data=valid_data)
+        assert serializer.is_valid()
+
+        # Valid data with comment_id
+        valid_data_comment = {
+            'muted_user_id': 123,
+            'course_id': 'course-v1:Test+Course+Run',
+            'scope': 'personal',
+            'reason': 'Spam content',
+            'comment_id': 'test_comment_456'
+        }
+        serializer = MuteAndReportRequestSerializer(data=valid_data_comment)
+        assert serializer.is_valid()
+
+    def test_unmute_request_serializer(self):
+        """Test UnmuteRequestSerializer validation"""
+
+        # Valid data
+        valid_data = {
+            'muted_user_id': 123,
+            'course_id': 'course-v1:Test+Course+Run',
+            'scope': 'personal'
+        }
+        serializer = UnmuteRequestSerializer(data=valid_data)
+        assert serializer.is_valid()
+
+        # Missing course_id
+        invalid_data = {
+            'muted_user_id': 123,
+            'scope': 'personal'
+        }
+        serializer = UnmuteRequestSerializer(data=invalid_data)
+        assert not serializer.is_valid()
+        assert 'course_id' in serializer.errors
+
+    def test_mute_status_serializer(self):
+        """Test MuteStatusSerializer"""
+
+        # Test with muted status
+        muted_data = {
+            'is_muted': True,
+            'mute_type': 'personal',
+            'mute_details': {
+                'muted_by': {'id': 123, 'username': 'test_user'},
+                'created': '2023-01-01T00:00:00Z',
+                'scope': 'personal'
+            }
+        }
+        serializer = MuteStatusSerializer(data=muted_data)
+        assert serializer.is_valid()
+
+        # Test with not muted status
+        not_muted_data = {
+            'is_muted': False,
+            'mute_type': '',
+            'mute_details': {}
+        }
+        serializer = MuteStatusSerializer(data=not_muted_data)
+        assert serializer.is_valid()

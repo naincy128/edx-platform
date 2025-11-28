@@ -55,6 +55,9 @@ from openedx.core.djangoapps.discussions.tasks import update_discussions_setting
 from openedx.core.djangoapps.django_comment_common.models import (
     CourseDiscussionSettings,
     Role,
+    DiscussionMuteException,
+    DiscussionModerationLog,
+    DiscussionMute,
 )
 from openedx.core.djangoapps.django_comment_common.utils import seed_permissions_roles
 from openedx.core.djangoapps.oauth_dispatch.jwt import create_jwt_for_user
@@ -2026,3 +2029,492 @@ class CourseActivityStatsTest(ForumsEnableMixin, UrlResetMixin, CommentsServiceM
         """
         response = get_usernames_from_search_string(self.course_key, username_search_string, 1, 1)
         assert response == (username_search_string.lower(), 1, 1)
+
+
+@ddt.ddt
+class DiscussionModerationTestCase(DiscussionAPIViewTestMixin, ModuleStoreTestCase):
+    """
+    Test suite for discussion moderation functionality (mute/unmute).
+    Tests all 11 requirements from the user's specification.
+    """
+
+    @mock.patch.dict("django.conf.settings.FEATURES", {"ENABLE_DISCUSSION_SERVICE": True})
+    def setUp(self):
+        super().setUp()
+
+        # Create additional users for testing
+        self.target_learner = UserFactory.create(password=self.password)
+        self.target_learner.profile.year_of_birth = 1970
+        self.target_learner.profile.save()
+        CourseEnrollmentFactory.create(user=self.target_learner, course_id=self.course.id)
+
+        self.other_learner = UserFactory.create(password=self.password)
+        self.other_learner.profile.year_of_birth = 1970
+        self.other_learner.profile.save()
+        CourseEnrollmentFactory.create(user=self.other_learner, course_id=self.course.id)
+
+        # Create staff user
+        self.staff_user = UserFactory.create(password=self.password)
+        self.staff_user.profile.year_of_birth = 1970
+        self.staff_user.profile.save()
+        CourseEnrollmentFactory.create(user=self.staff_user, course_id=self.course.id)
+        CourseStaffRole(self.course.id).add_users(self.staff_user)
+
+        # Create instructor user
+        self.instructor = UserFactory.create(password=self.password)
+        self.instructor.profile.year_of_birth = 1970
+        self.instructor.profile.save()
+        CourseEnrollmentFactory.create(user=self.instructor, course_id=self.course.id)
+        CourseInstructorRole(self.course.id).add_users(self.instructor)
+
+        # URLs
+        self.mute_url = reverse('mute_user', kwargs={'course_id': str(self.course.id)})
+        self.unmute_url = reverse('unmute_user', kwargs={'course_id': str(self.course.id)})
+        self.mute_and_report_url = reverse('mute_and_report', kwargs={'course_id': str(self.course.id)})
+        self.muted_users_url = reverse('muted_users_list', kwargs={'course_id': str(self.course.id)})
+        self.mute_status_url = reverse('mute_status', kwargs={'course_id': str(self.course.id)})
+
+        # Set url for DiscussionAPIViewTestMixin compatibility
+        self.url = self.mute_url
+
+    def _create_test_mute(self, muted_user, muted_by, scope='personal', is_active=True):
+        """Helper method to create a mute record for testing"""
+        return DiscussionMute.objects.create(
+            muted_user=muted_user,
+            muted_by=muted_by,
+            course_id=self.course.id,
+            scope=scope,
+            reason='Test reason',
+            is_active=is_active
+        )
+
+    def _login_user(self, user):
+        """Helper method to login a user"""
+        self.client.login(username=user.username, password=self.password)
+
+    def test_basic(self):
+        """Basic test for DiscussionAPIViewTestMixin compatibility"""
+        self._login_user(self.user)
+        data = {
+            'muted_user_id': self.target_learner.id,
+            'course_id': str(self.course.id),
+            'scope': 'personal'
+        }
+        response = self.client.post(self.mute_url, data, format='json')
+        assert response.status_code in [status.HTTP_201_CREATED, status.HTTP_200_OK]
+
+    # Test 1: Personal Mute (Learner → Learner & Staff → Learner)
+    def test_personal_mute_learner_to_learner(self):
+        """Test that learners can perform personal mutes on other learners"""
+
+        self._login_user(self.user)
+        data = {
+            'muted_user_id': self.target_learner.id,
+            'course_id': str(self.course.id),
+            'scope': 'personal',
+            'reason': 'Testing personal mute'
+        }
+
+        response = self.client.post(self.mute_url, data, format='json')
+
+        # Assert response is successful
+        assert response.status_code == status.HTTP_201_CREATED
+        response_data = response.json()
+        assert response_data['status'] == 'success'
+        assert response_data['message'] == 'User muted successfully'
+
+        # Assert mute record was created
+        mute = DiscussionMute.objects.get(
+            muted_user=self.target_learner,
+            muted_by=self.user,
+            course_id=self.course.id,
+            scope='personal'
+        )
+        assert mute.is_active is True
+        assert mute.reason == 'Testing personal mute'
+
+        # Assert moderation log was created
+        log = DiscussionModerationLog.objects.get(
+            action_type=DiscussionModerationLog.ACTION_MUTE,
+            target_user=self.target_learner,
+            moderator=self.user,
+            course_id=self.course.id
+        )
+        assert log.scope == 'personal'
+
+    def test_personal_mute_staff_to_learner(self):
+        """Test that staff can perform personal mutes on learners"""
+
+        self._login_user(self.staff_user)
+        data = {
+            'muted_user_id': self.target_learner.id,
+            'course_id': str(self.course.id),
+            'scope': 'personal',
+            'reason': 'Staff personal mute'
+        }
+
+        response = self.client.post(self.mute_url, data, format='json')
+
+        assert response.status_code == status.HTTP_201_CREATED
+        assert DiscussionMute.objects.filter(
+            muted_user=self.target_learner,
+            muted_by=self.staff_user,
+            scope='personal'
+        ).exists()
+
+    # Test 2: Self-Mute Prevention
+    def test_learner_cannot_mute_self(self):
+        """Test that learners cannot mute themselves"""
+        self._login_user(self.user)
+        data = {
+            'muted_user_id': self.user.id,
+            'course_id': str(self.course.id),
+            'scope': 'personal'
+        }
+
+        response = self.client.post(self.mute_url, data, format='json')
+
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        response_data = response.json()
+        assert response_data['status'] == 'error'
+        assert 'cannot mute themselves' in response_data['message']
+
+    def test_staff_cannot_mute_self(self):
+        """Test that staff cannot mute themselves"""
+        self._login_user(self.staff_user)
+        data = {
+            'muted_user_id': self.staff_user.id,
+            'course_id': str(self.course.id),
+            'scope': 'course'
+        }
+
+        response = self.client.post(self.mute_url, data, format='json')
+
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        response_data = response.json()
+        assert 'cannot mute themselves' in response_data['message']
+
+    # Test 3: Course-Level Mute (Staff Only)
+    def test_course_level_mute_by_staff(self):
+        """Test that staff can perform course-level mutes"""
+
+        self._login_user(self.staff_user)
+        data = {
+            'muted_user_id': self.target_learner.id,
+            'course_id': str(self.course.id),
+            'scope': 'course',
+            'reason': 'Course-wide mute for disruptive behavior'
+        }
+
+        response = self.client.post(self.mute_url, data, format='json')
+
+        assert response.status_code == status.HTTP_201_CREATED
+        mute = DiscussionMute.objects.get(
+            muted_user=self.target_learner,
+            muted_by=self.staff_user,
+            scope='course'
+        )
+        assert mute.is_active is True
+
+    def test_learner_cannot_do_course_level_mute(self):
+        """Test that learners cannot perform course-level mutes"""
+        self._login_user(self.user)
+        data = {
+            'muted_user_id': self.target_learner.id,
+            'course_id': str(self.course.id),
+            'scope': 'course'
+        }
+
+        response = self.client.post(self.mute_url, data, format='json')
+
+        assert response.status_code == status.HTTP_403_FORBIDDEN
+
+    # Test 4: Prevent Muting Staff
+    def test_learner_cannot_mute_staff(self):
+        """Test that learners cannot mute staff members"""
+        self._login_user(self.user)
+        data = {
+            'muted_user_id': self.staff_user.id,
+            'course_id': str(self.course.id),
+            'scope': 'personal'
+        }
+
+        response = self.client.post(self.mute_url, data, format='json')
+
+        assert response.status_code == status.HTTP_403_FORBIDDEN
+
+    def test_learner_cannot_mute_instructor(self):
+        """Test that learners cannot mute instructors"""
+        self._login_user(self.user)
+        data = {
+            'muted_user_id': self.instructor.id,
+            'course_id': str(self.course.id),
+            'scope': 'personal'
+        }
+
+        response = self.client.post(self.mute_url, data, format='json')
+
+        assert response.status_code == status.HTTP_403_FORBIDDEN
+
+    # Test 5: Mute + Report
+    @mock.patch('openedx.core.djangoapps.django_comment_common.comment_client.thread.Thread.find')
+    def test_mute_and_report_with_thread(self, mock_thread_find):
+        """Test mute and report functionality with thread ID"""
+
+        # Mock the thread
+        mock_thread = mock.Mock()
+        mock_thread.flagAbuse = mock.Mock()
+        mock_thread_find.return_value = mock_thread
+
+        self._login_user(self.user)
+        data = {
+            'muted_user_id': self.target_learner.id,
+            'course_id': str(self.course.id),
+            'scope': 'personal',
+            'reason': 'Inappropriate content',
+            'thread_id': 'test_thread_123'
+        }
+
+        response = self.client.post(self.mute_and_report_url, data, format='json')
+
+        assert response.status_code == status.HTTP_201_CREATED
+
+        # Assert mute record was created
+        assert DiscussionMute.objects.filter(
+            muted_user=self.target_learner,
+            muted_by=self.user
+        ).exists()
+
+        # Assert moderation log was created
+        log = DiscussionModerationLog.objects.get(
+            action_type=DiscussionModerationLog.ACTION_MUTE_AND_REPORT,
+            target_user=self.target_learner
+        )
+        assert log.metadata['thread_id'] == 'test_thread_123'
+
+    # Test 6: Personal Unmute
+    def test_personal_unmute(self):
+        """Test that users can unmute their own personal mutes, but not others'."""
+
+        # Create an existing personal mute by self.user
+        mute = self._create_test_mute(self.target_learner, self.user, 'personal')
+        # Login as the user who muted
+        self._login_user(self.user)
+        data = {
+            'muted_user_id': self.target_learner.id,
+            'course_id': str(self.course.id),
+            'scope': 'personal'
+        }
+        # User should be able to unmute
+        response = self.client.post(self.unmute_url, data, format='json')
+        assert response.status_code == status.HTTP_200_OK
+        response_data = response.json()
+        assert response_data['status'] == 'success'
+        assert response_data.get('unmute_type') == 'deactivated'
+        # Assert mute was deactivated
+        mute.refresh_from_db()
+        assert mute.is_active is False
+
+        # Assert unmute log was created
+        assert DiscussionModerationLog.objects.filter(
+            action_type=DiscussionModerationLog.ACTION_UNMUTE,
+            target_user=self.target_learner,
+            moderator=self.user
+        ).exists()
+
+        # --- Negative test: other user cannot unmute this personal mute ---
+        other_user = self.other_learner
+        self._login_user(other_user)
+        response = self.client.post(self.unmute_url, data, format='json')
+        assert response.status_code in (status.HTTP_403_FORBIDDEN, status.HTTP_404_NOT_FOUND)
+        response_data = response.json()
+        msg = response_data.get('message', '').lower()
+        assert any(sub in msg for sub in ('permission', 'no active mute'))
+
+    # Test 7: Course-Level Mute With Personal Unmute Exception
+    def test_course_mute_with_personal_unmute_exception(self):
+        """Test that personal unmute creates exception for course-wide mute"""
+
+        # Create a course-wide mute by staff
+        self._create_test_mute(self.target_learner, self.staff_user, 'course')
+
+        # Learner tries to unmute personally
+        self._login_user(self.user)
+        data = {
+            'muted_user_id': self.target_learner.id,
+            'course_id': str(self.course.id),
+            'scope': 'personal'
+        }
+
+        response = self.client.post(self.unmute_url, data, format='json')
+
+        assert response.status_code == status.HTTP_201_CREATED
+        response_data = response.json()
+        assert response_data['unmute_type'] == 'exception'
+
+        # Assert exception was created
+        exception = DiscussionMuteException.objects.get(
+            muted_user=self.target_learner,
+            exception_user=self.user,
+            course_id=self.course.id
+        )
+        assert exception is not None
+
+    # Test 8: List Muted Users
+    def test_list_personal_muted_users(self):
+        """Test listing personal muted users"""
+        # Create some mutes
+        self._create_test_mute(self.target_learner, self.user, 'personal')
+        self._create_test_mute(self.other_learner, self.user, 'personal')
+
+        self._login_user(self.user)
+        response = self.client.get(self.muted_users_url + '?scope=personal')
+
+        assert response.status_code == status.HTTP_200_OK
+        data = response.json()
+        assert data['count'] == 2
+        assert len(data['results']) == 2
+
+    def test_list_course_muted_users_staff_only(self):
+        """Test that only staff can list course-wide muted users"""
+        # Create course-wide mute
+        self._create_test_mute(self.target_learner, self.staff_user, 'course')
+
+        # Learner tries to access course mutes
+        self._login_user(self.user)
+        response = self.client.get(self.muted_users_url + '?scope=course')
+
+        assert response.status_code == status.HTTP_403_FORBIDDEN
+
+        # Staff can access course mutes
+        self._login_user(self.staff_user)
+        response = self.client.get(self.muted_users_url + '?scope=course')
+
+        assert response.status_code == status.HTTP_200_OK
+
+    # Test 9: Mute Status
+    def test_mute_status_personal_mute(self):
+        """Test mute status for personal mute"""
+        # Create personal mute
+        self._create_test_mute(self.target_learner, self.user, 'personal')
+
+        self._login_user(self.user)
+        response = self.client.get(
+            self.mute_status_url + f'?user_id={self.target_learner.id}'
+        )
+
+        assert response.status_code == status.HTTP_200_OK
+        data = response.json()
+        assert data['is_muted'] is True
+        assert data['mute_type'] == 'personal'
+
+    def test_mute_status_course_mute(self):
+        """Test mute status for course-wide mute"""
+        # Create course-wide mute
+        self._create_test_mute(self.target_learner, self.staff_user, 'course')
+
+        self._login_user(self.user)
+        response = self.client.get(
+            self.mute_status_url + f'?user_id={self.target_learner.id}'
+        )
+
+        assert response.status_code == status.HTTP_200_OK
+        data = response.json()
+        assert data['is_muted'] is True
+        assert data['mute_type'] == 'course'
+
+    def test_mute_status_no_mute(self):
+        """Test mute status when user is not muted"""
+        self._login_user(self.user)
+        response = self.client.get(
+            self.mute_status_url + f'?user_id={self.target_learner.id}'
+        )
+
+        assert response.status_code == status.HTTP_200_OK
+        data = response.json()
+        assert data['is_muted'] is False
+        assert data['mute_type'] == ''
+
+    # Test 10: Duplicate Mute Prevention
+    def test_duplicate_mute_prevention(self):
+        """Test that duplicate mutes are prevented"""
+        # Create initial mute
+        self._create_test_mute(self.target_learner, self.user, 'personal')
+
+        # Try to create duplicate mute
+        self._login_user(self.user)
+        data = {
+            'muted_user_id': self.target_learner.id,
+            'course_id': str(self.course.id),
+            'scope': 'personal'
+        }
+
+        response = self.client.post(self.mute_url, data, format='json')
+
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        response_data = response.json()
+        assert 'already muted' in response_data['message']
+
+    # Test 11: Authentication and Authorization
+    def test_mute_requires_authentication(self):
+        """Test that mute endpoints require authentication"""
+        self.client.logout()
+
+        data = {
+            'muted_user_id': self.target_learner.id,
+            'course_id': str(self.course.id)
+        }
+
+        response = self.client.post(self.mute_url, data, format='json')
+        # CanMuteUsers permission returns 401 for unauthenticated users
+        assert response.status_code == status.HTTP_401_UNAUTHORIZED
+
+    def test_mute_requires_course_enrollment(self):
+        """Test that mute requires course enrollment"""
+        # Create user not enrolled in course
+        non_enrolled_user = UserFactory.create(password=self.password)
+
+        self.client.login(username=non_enrolled_user.username, password=self.password)
+        data = {
+            'muted_user_id': self.target_learner.id,
+            'course_id': str(self.course.id)
+        }
+
+        response = self.client.post(self.mute_url, data, format='json')
+        assert response.status_code == status.HTTP_403_FORBIDDEN
+
+    # Test 12: Invalid Data Handling
+    def test_mute_invalid_user_id(self):
+        """Test mute with invalid user ID"""
+        self._login_user(self.user)
+        data = {
+            'muted_user_id': 99999,
+            'course_id': str(self.course.id)
+        }
+
+        response = self.client.post(self.mute_url, data, format='json')
+        assert response.status_code == status.HTTP_404_NOT_FOUND
+
+    def test_mute_invalid_course_id(self):
+        """Test mute with invalid course ID"""
+        self._login_user(self.user)
+        data = {
+            'muted_user_id': self.target_learner.id,
+            'course_id': 'invalid_course_id'
+        }
+
+        response = self.client.post(self.mute_url, data, format='json')
+        # Permission check happens first and fails for invalid course ID
+        assert response.status_code == status.HTTP_403_FORBIDDEN
+
+    def test_unmute_nonexistent_mute(self):
+        """Test unmuting when no mute exists"""
+        self._login_user(self.user)
+        data = {
+            'muted_user_id': self.target_learner.id,
+            'course_id': str(self.course.id),
+            'scope': 'personal'
+        }
+
+        response = self.client.post(self.unmute_url, data, format='json')
+        assert response.status_code == status.HTTP_404_NOT_FOUND
